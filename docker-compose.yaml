@@ -1,0 +1,152 @@
+version: "3.8"
+
+services:
+  rabbitmq:
+    container_name: mdcc_nuvem_rabbitmq
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=admin
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdcc_nuvem_network
+
+  minio:
+    container_name: mdcc_nuvem_minio
+    image: minio/minio:latest
+    ports:
+      - "9900:9000"
+      - "9901:9001"
+    command: minio server /data --console-address ":9001"
+    environment:
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+    volumes:
+    - minio_data:/data
+    networks:
+      - mdcc_nuvem_network
+
+  createbuckets:
+    container_name: mdcc_nuvem_createbuckets
+    image: minio/minio:latest
+    depends_on:
+      - minio
+    restart: on-failure
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set dockerminio http://minio:9000 minio minio123;
+      /usr/bin/mc mb dockerminio/nuvembucket;
+      /usr/bin/mc mb dockerminio/nuvembucket-media;
+      /usr/bin/mc mb dockerminio/nuvembucket-static;
+      /usr/bin/mc anonymous set public dockerminio/nuvembucket;
+      /usr/bin/mc anonymous set public dockerminio/nuvembucket-media;
+      /usr/bin/mc anonymous set public dockerminio/nuvembucket-static;
+      exit 0;
+      "
+    networks:
+      - mdcc_nuvem_network
+
+  postgres:
+    container_name: mdcc_nuvem_postgres
+    image: postgres:14-alpine
+    volumes:
+      - mdcc_nuvem_db_storage:/var/lib/postgresql/data
+      - ./init-database.sh:/docker-entrypoint-initdb.d/init-database.sh
+    restart: on-failure
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=mdcc_nuvem_t2
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5433
+    ports:
+      - "5433:5432"
+    networks:
+      - mdcc_nuvem_network
+
+  backend_t2:
+    container_name: mdcc_nuvem_backend_t2
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./backend:/app:cached
+    command: ["bash", "./entrypoint.dev.sh"]
+    restart: on-failure
+    env_file:
+      - ./backend/.env.docker
+    ports:
+      - "8001:8000"
+    depends_on:
+      - postgres
+      - rabbitmq
+      - minio
+      - createbuckets
+    networks:
+      - mdcc_nuvem_network
+
+  celery:
+    container_name: celery
+    platform: linux/amd64
+    build:
+      context: ./backend
+      dockerfile: docker/celery/dev/Dockerfile
+    command: python3 -m celery -A django_app.celery_nuvem:app worker -E
+    healthcheck:
+      test: ["CMD", "python3", "-m", "celery", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - ./backend:/usr/src/app/:cached
+      - ./backend:/mdcc_nuvem_backend_t2:cached
+    env_file: ./backend/.env.docker
+    depends_on:
+      - postgres
+      - rabbitmq
+      - backend_t2
+    networks:
+      - mdcc_nuvem_network
+
+
+  frontend:
+    container_name: mdcc_nuvem_frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    volumes:
+      - ./frontend:/app:cached
+      - /app/node_modules
+      - /app/.next
+    command: ["npm", "run", "dev"]
+    restart: on-failure
+    env_file:
+      - ./frontend/.env.docker
+    ports:
+      - "3001:3000"
+    depends_on:
+      - backend_t2
+    networks:
+      - mdcc_nuvem_network
+
+volumes:
+  mdcc_nuvem_db_storage:
+  rabbitmq_data:
+  celery_data:
+  celery_beat_data:
+  minio_data:
+  minio_client_data:
+
+networks:
+  mdcc_nuvem_network:
+    driver: bridge
